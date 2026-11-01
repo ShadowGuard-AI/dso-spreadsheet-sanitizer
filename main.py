@@ -32,6 +32,10 @@ def _same_path(a, b):
     return os.path.realpath(a) == os.path.realpath(b)
 
 
+# An xlsx or ods file is a zip of XML parts, so I work on the parts in
+# memory and never unzip to disk. The ZipInfo objects ride along with the
+# bytes because the write side reuses them to keep each part's name and
+# stored metadata instead of inventing fresh entries.
 def _read_zip_entries(input_file):
     with zipfile.ZipFile(input_file, 'r') as zin:
         return [(item, zin.read(item.filename)) for item in zin.infolist()]
@@ -48,6 +52,9 @@ def _remove_hidden_sheets_xlsx(entries):
     by_name = {item.filename: data for item, data in entries}
     if 'xl/workbook.xml' not in by_name:
         raise ValueError("xl/workbook.xml not found")
+    # register_namespace before every parse and serialize cycle. Without it
+    # ElementTree invents ns0 style prefixes, and Excel refuses files whose
+    # workbook part uses prefixes it did not write.
     ET.register_namespace('', MAIN_NS)
     ET.register_namespace('r', REL_NS)
     tree = ET.fromstring(by_name['xl/workbook.xml'])
@@ -79,15 +86,24 @@ def _remove_hidden_sheets_xlsx(entries):
         rel = rel_by_id.get(rid)
         if rel is None:
             raise ValueError(f"hidden sheet relationship {rid} not found")
+        # Relationship targets come in two spellings: package absolute (/xl/...)
+        # and relative to the workbook part (worksheets/...). Both have to land on
+        # the same zip entry name before I can trust the part lookup below.
         target = rel.get('Target')
         if target.startswith('/'):
             part = target.lstrip('/')
         else:
             part = 'xl/' + target
+        # normpath collapses any .. segments in the target, and the separator swap
+        # keeps that working for workbooks authored on Windows. Zip entry names
+        # always use forward slashes.
         part = os.path.normpath(part).replace(os.sep, '/')
         if part not in by_name:
             raise ValueError(f"hidden sheet part {part} not found")
         removed_parts.append(part)
+        # Three records have to agree before a sheet is really gone: the sheet
+        # element here, its relationship, and its content type override below.
+        # Removing only the element would leave Excel a dangling reference.
         sheets_el.remove(sheet)
         rels_tree.remove(rel)
         logging.info(f"Removing hidden sheet: {sheet.get('name')}")
@@ -109,6 +125,9 @@ def _remove_hidden_sheets_xlsx(entries):
     return new_entries, len(hidden)
 
 
+# Dropping vbaProject.bin alone is not enough. The content type still
+# declares a macro enabled workbook and the rels still point at the part,
+# so all three are rewritten in this one pass.
 def _remove_macros_xlsx(entries):
     """Remove the VBA project and its references. Returns (entries, removed_count)."""
     names = [item.filename for item, data in entries]
@@ -127,6 +146,9 @@ def _remove_macros_xlsx(entries):
                 if override.get('PartName') == '/xl/vbaProject.bin':
                     ct_tree.remove(override)
                 ct = override.get('ContentType') or ''
+                # The workbook's own content type is downgraded from macroEnabled to the
+                # plain sheet type. Skip this and Excel keeps treating the file as a
+                # macro workbook that is missing its macro part.
                 if 'macroEnabled' in ct:
                     override.set('ContentType', ct.replace(
                         'application/vnd.ms-excel.sheet.macroEnabled.main+xml',
@@ -143,6 +165,10 @@ def _remove_macros_xlsx(entries):
     return new_entries, 1
 
 
+# All three format paths share one contract: True only when something was
+# actually removed or neutralized and written. A run that changed nothing
+# returns False, because an untouched copy labelled sanitized would be a
+# lie the caller could act on.
 def sanitize_xlsx(input_file, output_file, remove_macros, remove_hidden_sheets, overwrite):
     try:
         if _same_path(input_file, output_file):
@@ -188,6 +214,9 @@ def _remove_hidden_tables_ods(entries):
     ET.register_namespace('table', TABLE_NS)
     ET.register_namespace('text', TEXT_NS)
     tree = ET.fromstring(by_name['content.xml'])
+    # ElementTree elements have no parent pointer, so I build the map first.
+    # A hidden table can sit under several different containers in ODS
+    # content, and remove() has to be called on whichever parent holds it.
     parent = {child: p for p in tree.iter() for child in p}
     hidden = []
     for table in tree.iter(f'{{{TABLE_NS}}}table'):
@@ -267,6 +296,10 @@ def sanitize_csv(input_file, output_file, overwrite):
         for row in rows:
             new_row = []
             for cell in row:
+                # I check the first character only. A leading apostrophe makes Excel and
+                # LibreOffice treat the cell as text, which kills the formula without
+                # changing what a reader sees in the value. Cells starting with a dash or
+                # a tab are not covered here, and I note that as a gap, not a feature.
                 if cell[:1] in ('=', '+', '@'):
                     new_row.append("'" + cell)
                     neutralized += 1
@@ -289,6 +322,9 @@ def sanitize_csv(input_file, output_file, overwrite):
         return False
 
 
+# The per-format functions return True or False and log their own reason.
+# main only translates that into an exit code and repeats the same-path
+# refusal up front, so a bad invocation fails before any file is opened.
 def main():
     args = setup_argparse()
     input_file = args.input_file
